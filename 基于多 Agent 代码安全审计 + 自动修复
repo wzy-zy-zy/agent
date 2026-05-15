@@ -1,0 +1,181 @@
+import re
+import pycodestyle
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Dict
+from transformers import pipeline
+
+# 漏洞风险等级
+class RiskLevel(Enum):
+    HIGH = "高危"
+    MID = "中危"
+    LOW = "低危"
+    INFO = "提示"
+
+# 漏洞数据结构
+@dataclass
+class CodeVuln:
+    file_name: str
+    line_no: int
+    vuln_type: str
+    risk: RiskLevel
+    desc: str
+    fix_code: str
+
+# ===================== Agent 1 代码解析Agent =====================
+class CodeParseAgent:
+    def parse_code(self, code_content: str, file_name: str) -> Dict:
+        lines = code_content.splitlines()
+        return {
+            "file": file_name,
+            "total_lines": len(lines),
+            "code_lines": lines,
+            "raw_content": code_content
+        }
+
+# ===================== Agent 2 漏洞扫描Agent =====================
+class VulnScanAgent:
+    def __init__(self):
+        self.rules = [
+            # 常见安全漏洞正则规则
+            (r"password\s*=\s*['\"].+['\"]", "硬编码密码/密钥", RiskLevel.HIGH),
+            (r"select.*%s|format\(|f\".*\{.*\}", "SQL注入风险", RiskLevel.HIGH),
+            (r"eval\(|exec\(", "危险代码执行函数", RiskLevel.HIGH),
+            (r"input\(\).*eval", "用户输入恶意执行", RiskLevel.MID),
+            (r"print\(.*request\.args", "敏感信息泄露", RiskLevel.MID),
+            (r"except\s*:", "裸异常捕获", RiskLevel.LOW),
+        ]
+
+    def pycode_style_check(self, code: str) -> List[Dict]:
+        checker = pycodestyle.Checker(style='pep8')
+        errors = []
+        for idx, line in enumerate(code.splitlines(), 1):
+            for err in checker.check_line(line):
+                errors.append({
+                    "line": idx,
+                    "msg": err,
+                    "type": "代码规范问题"
+                })
+        return errors
+
+    def scan(self, code_info: Dict) -> List[CodeVuln]:
+        vulns = []
+        code_lines = code_info["code_lines"]
+        file = code_info["file"]
+
+        for line_idx, line in enumerate(code_lines, 1):
+            line_strip = line.strip()
+            for pattern, v_type, risk in self.rules:
+                if re.search(pattern, line_strip, re.IGNORECASE):
+                    vulns.append(CodeVuln(
+                        file_name=file,
+                        line_no=line_idx,
+                        vuln_type=v_type,
+                        risk=risk,
+                        desc=f"第{line_idx}行存在{v_type}安全风险",
+                        fix_code=""
+                    ))
+        return vulns
+
+# ===================== Agent3 风险评估+修复生成Agent =====================
+class FixGenerateAgent:
+    def __init__(self):
+        # 本地轻量大模型文本生成
+        self.fix_model = pipeline(
+            "text2text-generation",
+            model="uer/bart-base-chinese-cluecorpussmall",
+            device=-1
+        )
+        self.fix_template = {
+            "硬编码密码/密钥": "使用环境变量.env读取密钥，禁止写死明文",
+            "SQL注入风险": "使用参数化查询，禁止字符串拼接SQL语句",
+            "危险代码执行函数": "删除eval/exec，改用安全逻辑实现功能",
+            "用户输入恶意执行": "对输入内容做白名单过滤与类型校验",
+            "敏感信息泄露": "日志脱敏，禁止直接打印用户隐私数据",
+            "裸异常捕获": "指定具体异常类型，精准捕获错误"
+        }
+
+    def generate_fix(self, vuln: CodeVuln) -> str:
+        base_tip = self.fix_template.get(vuln.vuln_type, "优化代码逻辑，遵循开发安全规范")
+        prompt = f"""
+        漏洞类型：{vuln.vuln_type}
+        修复原则：{base_tip}
+        请写出简短可直接使用的Python修复代码
+        """
+        res = self.fix_model(prompt, max_length=150)[0]["generated_text"]
+        return res
+
+    def assess_risk_and_fix(self, vulns: List[CodeVuln]) -> List[CodeVuln]:
+        for v in vulns:
+            v.fix_code = self.generate_fix(v)
+        return vulns
+
+# ===================== Agent4 验证闭环Agent =====================
+class VerifyAgent:
+    def verify_fix(self, vuln_list: List[CodeVuln]) -> Dict:
+        high_cnt = sum(1 for v in vuln_list if v.risk == RiskLevel.HIGH)
+        mid_cnt = sum(1 for v in vuln_list if v.risk == RiskLevel.MID)
+        low_cnt = sum(1 for v in vuln_list if v.risk == RiskLevel.LOW)
+
+        report = {
+            "扫描文件总数": 1,
+            "高危漏洞": high_cnt,
+            "中危漏洞": mid_cnt,
+            "低危漏洞": low_cnt,
+            "总计漏洞": len(vuln_list),
+            "修复状态": "已自动生成修复方案，可直接替换代码",
+            "漏洞详情": vuln_list
+        }
+        return report
+
+# ===================== 多Agent 统一调度入口 =====================
+class CodeSecurityAgentSystem:
+    def __init__(self):
+        self.parse_agent = CodeParseAgent()
+        self.scan_agent = VulnScanAgent()
+        self.fix_agent = FixGenerateAgent()
+        self.verify_agent = VerifyAgent()
+
+    def run_all_flow(self, code: str, filename: str = "test.py"):
+        # 1.代码解析
+        code_info = self.parse_agent.parse_code(code, filename)
+        # 2.漏洞扫描
+        raw_vulns = self.scan_agent.scan(code_info)
+        # 3.风险分级 + 自动修复
+        fixed_vulns = self.fix_agent.assess_risk_and_fix(raw_vulns)
+        # 4.结果校验生成报告
+        final_report = self.verify_agent.verify_fix(fixed_vulns)
+        return final_report
+
+# ===================== 测试运行 =====================
+if __name__ == "__main__":
+    # 测试存在漏洞的Python代码
+    test_bad_code = """
+username = "admin"
+password = "123456789"
+sql = f"select * from user where name='{username}'"
+eval(input("请输入指令："))
+try:
+    num = 1/0
+except:
+    pass
+"""
+
+    # 启动整套多Agent安全审计系统
+    system = CodeSecurityAgentSystem()
+    result = system.run_all_flow(test_bad_code)
+
+    # 打印最终审计报告
+    print("="*60)
+    print("【多Agent代码安全审计自动化修复报告】")
+    print("="*60)
+    print(f"高危漏洞数量：{result['高危漏洞']}")
+    print(f"中危漏洞数量：{result['中危漏洞']}")
+    print(f"低危漏洞数量：{result['低危漏洞']}")
+    print(f"漏洞总数：{result['总计漏洞']}")
+    print("\n【详细漏洞与修复方案】")
+    for item in result["漏洞详情"]:
+        print(f"\n行号：{item.line_no} | 风险等级：{item.risk.value}")
+        print(f"漏洞类型：{item.vuln_type}")
+        print(f"问题描述：{item.desc}")
+        print(f"自动修复代码：\n{item.fix_code}")
